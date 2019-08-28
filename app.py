@@ -267,7 +267,7 @@ if __name__ == "__main__":
 
         password = getpass.getpass("Password: ")
         otp_secret = pyotp.random_base32()
-        bcrypt_rounds = os.getenv('BCRYPT_ROUNDS', '12')
+        bcrypt_rounds = int(os.getenv('BCRYPT_ROUNDS', '12'))
         user = {
             "username": username,
             "password": bcrypt.hashpw(password.encode("utf8"), bcrypt.gensalt(bcrypt_rounds)),

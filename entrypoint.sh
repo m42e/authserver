@@ -28,4 +28,4 @@ if [ "x${generate_keys}x" == "x1x" ]; then
     openssl rsa -in jwtRS256.key -pubout -outform PEM -out jwtRS256.key.pub
 fi
 
-exec "$@"
+exec python /app/app.py "$@"
