@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Login - 2nd Step</title>
+</head>
+<body>
+
+<h2>Login - 2nd Step</h2>
+
+<div id="login" >
+<form action="" method="post">
+<input type="text" placeholder="OTP" name="otp">
+<input class="btn btn-default" type="submit" value="Login">
+</form>
+{% if error %}
+<p class="error"><strong>Error:</strong> {{ error }}
+{% endif %}
+</div>
+</body>
+</html>
