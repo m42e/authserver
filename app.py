@@ -17,12 +17,14 @@ import os
 import sys
 import time
 import pyotp
+import secrets
 import bcrypt
 from pprint import pformat
 import dataset
 import jwt
 import functools
 import logging
+import argparse
 import gunicorn.app.base
 
 app = Flask(__name__)
@@ -30,7 +32,7 @@ app.config.from_envvar('FLASK_CONFIG_FILE', silent=True)
 
 db = dataset.connect(app.config['DB_PATH'])
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] p%(process)s {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s')
 _logger = logging.getLogger(__name__)
 
 
@@ -40,6 +42,7 @@ class AuthInfo(object):
 
     def __init__(self, token: bytes = None, data: dict = None):
         self._loadkeys()
+        self._decodestatus = False
         self._datacache = {}
         self.token = token
         self.max_age = self.default_timeout
@@ -62,14 +65,19 @@ class AuthInfo(object):
         with open("jwtRS256.key.pub") as f:
             self.publickey = f.read()
 
+    def _get_domain(self):
+        host_no_port = f'{request.host}:'.split(':', 1)[0]
+        return '.'.join(host_no_port.rsplit('.', 3)[-2:])
+
+
     def set_cookie(self, response, **kwargs):
-        _logger.debug("set cookie")
         self.update(
-            useragent=request.headers["User-Agent"],
             exp=datetime.datetime.utcnow()
             + datetime.timedelta(seconds=self.default_timeout),
         )
-        response.set_cookie("AUTHCOOKIE", self.token, max_age=self.max_age, **kwargs)
+        domain = self._get_domain()
+        _logger.debug("set cookie for domain %s", domain)
+        response.set_cookie("AUTHCOOKIE", self.token, max_age=self.max_age, domain=domain, **kwargs)
 
     def set_data(self, data, timeout=None):
         _logger.debug("set data: {}".format(data))
@@ -80,21 +88,26 @@ class AuthInfo(object):
         else:
             self.max_age = timeout
         self.token = jwt.encode(data, self.privatekey, algorithm="RS256")
-        self._datacache = {}
+        self._decodestatus = False
 
     def get_data(self):
         try:
-            _logger.info("decode")
+            _logger.info("decode %s", self.token)
             self._datacache = jwt.decode(self.token, self.publickey, algorithm="RS256")
             if "exp" in self._datacache:
                 self.max_age = (
                     datetime.datetime.fromtimestamp(self._datacache["exp"])
                     - datetime.datetime.utcnow()
                 )
+        except (jwt.exceptions.InvalidTokenError, jwt.exceptions.DecodeError, jwt.exceptions.InvalidSignatureError, jwt.exceptions.ExpiredSignatureError, jwt.exceptions.InvalidAudienceError, jwt.exceptions.InvalidIssuerError, jwt.exceptions.InvalidIssuedAtError, jwt.exceptions.ImmatureSignatureError, jwt.exceptions.InvalidKeyError, jwt.exceptions.InvalidAlgorithmError, jwt.exceptions.MissingRequiredClaimError) as e:
+            _logger.exception("JWT invalid")
+            self.token = b''
+            self._datacache = {}
         except Exception as e:
             _logger.exception("decoding error")
-            self._datacache = {}
+            raise
         finally:
+            self._decodestatus = True
             return self._datacache
 
     def update(self, **kwargs):
@@ -115,7 +128,7 @@ class AuthInfo(object):
 
     @property
     def data(self):
-        if len(self._datacache) == 0:
+        if not self._decodestatus:
             self.get_data()
         return self._datacache
 
@@ -130,9 +143,10 @@ def inject_ai(func):
     return decorator
 
 
-def authenticate(ai):
-    if "fwd" in ai.data:
+def authenticate(ai, forward=True):
+    if forward and "fwd" in ai.data:
         response = make_response(redirect(ai.data["fwd"]))
+        ai.update(fwd=None)
     else:
         response = make_response("success")
     ai.set_cookie(response)
@@ -147,16 +161,18 @@ def do_logout(ai):
     return "logged out", 401
 
 
+@app.route("/auth/login", methods=["POST", "GET"])
 @app.route("/login", methods=["POST", "GET"])
 @inject_ai
 def do_login(ai):
     if "fwd" in request.values:
         ai.update(fwd=request.values["fwd"])
+
     if ai.isset and 'username' in ai.data:
         _logger.debug("login using cookie")
         return authenticate(ai)
 
-    if request.method == "GET":
+    if request.method == "GET" and not 'Authorization' in request.headers:
         if ai.isset and "otp" in ai.data and "uuid" in ai.data["otp"]:
             return render_template("otp.html")
         return render_template("login.html")
@@ -189,13 +205,26 @@ def do_login(ai):
         ai.update(otp=None, username=entry["username"])
         return authenticate(ai)
 
-    try:
-        user = request.form["username"]
-        pwd = request.form["password"].encode("utf8")
-    except KeyError:
-        return redirect(url_for("do_login"))
-
     appusers = db["appuser"]
+    _logger.info(request.headers)
+    if 'Authorization' in request.headers:
+        auth_header = request.headers.get('Authorization')
+        typ, content = auth_header.split(' ', 1)
+        typ = typ.lower()
+        _logger.info(typ)
+        if typ == 'basic':
+            user, pwd = base64.b64decode(bytes(content, 'utf-8')).decode('utf-8').split(':')
+        elif typ == 'token':
+            appuser = appusers.find_one(password=content)
+            ai.update(username=appuser["username"])
+            return authenticate(ai)
+    else:
+        try:
+            user = request.form["username"]
+            pwd = request.form["password"].encode("utf8")
+        except KeyError:
+            return redirect(url_for("do_login"))
+
     validuser = users.find_one(username=user)
     validappuser = appusers.find(username=user)
     if validuser is not None:
@@ -225,13 +254,13 @@ def do_login(ai):
     return redirect(url_for("do_login"))
 
 
+@app.route("/auth/auth")
 @app.route("/auth")
 def hello():
-    _logger.debug(request.headers)
     ai = AuthInfo()
     if ai.isset and 'username' in ai.data:
         _logger.debug("login using cookie")
-        return authenticate(ai)
+        return authenticate(ai, False)
     _logger.debug("check failed")
     _logger.debug("forward to loginpage")
     abort(401)
@@ -258,26 +287,63 @@ class StandaloneApplication(gunicorn.app.base.BaseApplication):
     def load(self):
         return self.application
 
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(help='subcommand', title="commands", dest="command", required=False)
+    subparsers.add_parser('adduser', help='Add a User')
+    token = subparsers.add_parser('token', help='Add a User')
+    token.add_argument('user', type=str, help='username')
+    token.add_argument('--rm', type=str, help='token to remove', required=False)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
 
-    if len(sys.argv) == 2 and sys.argv[1] == "adduser":
-        username = input("Username: ")
-        import getpass
-        import pyqrcode
+    if len(list(filter(len, sys.argv))) >= 2:
+        args = parse_args()
+        if args.command == 'adduser':
 
-        password = getpass.getpass("Password: ")
-        otp_secret = pyotp.random_base32()
-        bcrypt_rounds = int(os.getenv('BCRYPT_ROUNDS', '12'))
-        user = {
-            "username": username,
-            "password": bcrypt.hashpw(password.encode("utf8"), bcrypt.gensalt(bcrypt_rounds)),
-            "otp": otp_secret,
-        }
-        db["users"].insert(user)
-        otp = pyotp.totp.TOTP(otp_secret).provisioning_uri(
-            username, issuer_name=os.getenv('TOTP_ISSUER', 'auth')
-        )
-        print(pyqrcode.create(otp).terminal())
+            username = input("Username: ")
+            import getpass
+            import pyqrcode
+            existing_user = db["users"].find_one(username=username)
+
+            while True:
+                password = getpass.getpass("Password: ")
+                password_repeat = getpass.getpass("Password (repeat): ")
+                if password == password_repeat:
+                    break
+                print('passwords do not match')
+            bcrypt_rounds = int(os.getenv('BCRYPT_ROUNDS', '12'))
+            user = {
+                "username": username,
+                "password": bcrypt.hashpw(password.encode("utf8"), bcrypt.gensalt(bcrypt_rounds)),
+            }
+            if existing_user is None:
+                otp_secret = pyotp.random_base32()
+                user["otp"] = otp_secret
+            else:
+                otp_secret = existing_user['otp']
+            db["users"].upsert(user, ['username'])
+            otp = pyotp.totp.TOTP(otp_secret).provisioning_uri(
+                username, issuer_name=os.getenv('TOTP_ISSUER', 'auth')
+            )
+            print(pyqrcode.create(otp).terminal())
+        elif args.command == 'token':
+            appusers = db["appuser"]
+            if args.rm is not None:
+                print('remove')
+                appusers.delete(password=args.rm)
+            else:
+                token = secrets.token_hex()
+                appusers.insert({
+                    'username': args.user,
+                    'password': token
+                })
+                print(token)
+            
+            pass
     else:
         port = os.getenv('GUNICORN_PORT', '9999')
         options = {
