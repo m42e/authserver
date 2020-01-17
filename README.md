@@ -68,3 +68,10 @@ location / {
 	}
 }
 ```
+
+# TODOs
+
+- Web interface for account and token managing
+- Rest interface for accounts and tokens.
+- Logging of Logins
+- Token activity
