@@ -1,7 +1,7 @@
 Click==7.0
 Flask==1.1.1
 Jinja2==2.11.3
-Mako==1.1.0
+Mako==1.2.2
 MarkupSafe==1.1.1
 PyJWT==2.4.0
 PyQRCode==1.2.1
